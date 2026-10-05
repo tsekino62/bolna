@@ -21,6 +21,7 @@ def _handler(turn_streamed_text):
     if not turn_streamed_text:
         stub._turn_audio_flushed.set()
     stub.synthesizer_tasks = []
+    stub._turn_eos_forwarded = False
     stub.forwarded = []
 
     async def _synthesize(packet):
@@ -51,3 +52,27 @@ async def test_a_mid_turn_empty_buffer_is_still_dropped():
     meta = {"request_id": "r", "sequence_id": 4}
     await TaskManager._handle_llm_output(stub, "synthesizer", "", False, meta)
     assert stub.synthesizer_tasks == []
+
+
+async def _forward(stub, text, end_of_llm_stream):
+    meta = {"request_id": "r", "sequence_id": 4}
+    if end_of_llm_stream:
+        meta["end_of_llm_stream"] = True
+    await TaskManager._handle_llm_output(stub, "synthesizer", text, False, meta)
+    await asyncio.gather(*stub.synthesizer_tasks)
+
+
+async def test_an_end_of_stream_already_sent_with_the_text_is_not_sent_again():
+    stub = _handler(turn_streamed_text=False)
+    await _forward(stub, "Sure, transferring you now.", end_of_llm_stream=True)
+    await _forward(stub, "", end_of_llm_stream=True)
+    assert [p["data"] for p in stub.forwarded] == ["Sure, transferring you now."]
+
+
+async def test_a_stream_that_resumes_after_its_end_still_gets_its_own_end_of_stream():
+    stub = _handler(turn_streamed_text=False)
+    await _forward(stub, "One moment.", end_of_llm_stream=True)
+    await _forward(stub, "Your booking is confirmed for", end_of_llm_stream=False)
+    await _forward(stub, "", end_of_llm_stream=True)
+    assert [p["data"] for p in stub.forwarded] == ["One moment.", "Your booking is confirmed for", ""]
+    assert stub.forwarded[-1]["meta_info"]["end_of_llm_stream"] is True

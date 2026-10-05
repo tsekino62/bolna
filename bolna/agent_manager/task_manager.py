@@ -460,6 +460,7 @@ class TaskManager(BaseManager):
         self._end_call_hangup_task = None
         self._turn_audio_flushed = asyncio.Event()
         self._turn_audio_flushed.set()
+        self._turn_eos_forwarded = False
         self.hangup_mark_event_timeout = 10
 
         # Prompts
@@ -3230,7 +3231,12 @@ class TaskManager(BaseManager):
         if next_step == "synthesizer" and not should_bypass_synth:
             if text_chunk and text_chunk.strip():
                 self._turn_audio_flushed.clear()
-            elif self.stream and meta_info.get("end_of_llm_stream") and not self._turn_audio_flushed.is_set():
+            elif (
+                self.stream
+                and meta_info.get("end_of_llm_stream")
+                and not self._turn_audio_flushed.is_set()
+                and not self._turn_eos_forwarded
+            ):
                 # The turn's last LLM buffer is often empty (the wrapper's rsplit leaves no
                 # remainder for the final flush); dropping it would swallow end_of_llm_stream
                 # and a streaming synthesizer would never flush the turn. Forward the bare
@@ -3239,6 +3245,9 @@ class TaskManager(BaseManager):
                 text_chunk = ""
             else:
                 return
+            # A second end-of-stream would open and close an empty synthesizer context that ends
+            # the turn before its audio arrives.
+            self._turn_eos_forwarded = bool(meta_info.get("end_of_llm_stream"))
             task = asyncio.create_task(self._synthesize(create_ws_data_packet(text_chunk, meta_info)))
             self.synthesizer_tasks.append(asyncio.ensure_future(task))
         elif self.tools["output"] is not None:
