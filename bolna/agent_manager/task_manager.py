@@ -130,7 +130,7 @@ from bolna.helpers.utils import (
 from bolna.helpers.logger_config import configure_logger
 from ..helpers.mark_event_meta_data import MarkEventMetaData
 from ..helpers.observable_variable import ObservableVariable
-from bolna.models import S2SConfig
+from bolna.models import S2SConfig, tts_render_settings
 from .models import ComponentLatencies
 from .voicemail_handler import VoicemailHandler
 
@@ -384,6 +384,7 @@ class TaskManager(BaseManager):
         self.language = DEFAULT_LANGUAGE_CODE
         self.synthesizer_voice_id = None
         self.synthesizer_model = None
+        self.synthesizer_render_settings = ""
         self.transfer_call_params = self.kwargs.get("transfer_call_params", None)
 
         if task["tools_config"].get("api_tools", None) is not None:
@@ -1947,6 +1948,7 @@ class TaskManager(BaseManager):
             self.synthesizer_voice = provider_config["voice"]
             self.synthesizer_voice_id = provider_config.get("voice_id")
             self.synthesizer_model = provider_config.get("model")
+            self.synthesizer_render_settings = tts_render_settings(self.synthesizer_provider, provider_config)
             if self.turn_based_conversation:
                 synth_config["audio_format"] = "mp3"  # Hard code mp3 if we're connected through dashboard
                 synth_config["stream"] = (
@@ -4013,6 +4015,8 @@ class TaskManager(BaseManager):
         # Stamped per chunk: after the loop these hold when the LLM actually finished and how
         # fast it started. __store_into_history runs much later (once every chunk has been
         # pushed to TTS), so the response trace row must be stamped from here, not from there.
+        # Row uses the first-text time: TTS starts on the first sentence, so stream end sorts it below its synth rows.
+        llm_first_text_ts = None
         llm_stream_end_ts = None
         llm_first_token_latency = None
         synthesize = True
@@ -4207,6 +4211,8 @@ class TaskManager(BaseManager):
                 end_of_llm_stream = llm_message.end_of_stream
                 latency = llm_message.latency
                 llm_stream_end_ts = time.time()
+                if llm_first_text_ts is None and isinstance(data, str) and data.strip():
+                    llm_first_text_ts = llm_stream_end_ts
                 if latency and latency.first_token_latency_ms is not None and llm_first_token_latency is None:
                     llm_first_token_latency = round(latency.first_token_latency_ms / 1000, 6)
                 trigger_function_call = llm_message.is_function_call
@@ -4275,7 +4281,7 @@ class TaskManager(BaseManager):
                             cached_tokens=actual_cached_tokens,
                             reasoning_content=actual_reasoning_content,
                             overflowed=actual_overflowed,
-                            ts=llm_stream_end_ts,
+                            ts=llm_first_text_ts or llm_stream_end_ts,
                             llm_latency=llm_first_token_latency,
                         )
                         if self.turn_based_conversation:
@@ -4390,7 +4396,7 @@ class TaskManager(BaseManager):
                 reasoning_content=actual_reasoning_content,
                 log_message=empty_turn_detail,
                 overflowed=actual_overflowed,
-                ts=llm_stream_end_ts,
+                ts=llm_first_text_ts or llm_stream_end_ts,
                 llm_latency=llm_first_token_latency,
             )
         elif not self.stream:
@@ -4412,7 +4418,7 @@ class TaskManager(BaseManager):
                 reasoning_tokens=actual_reasoning_tokens,
                 cached_tokens=actual_cached_tokens,
                 reasoning_content=actual_reasoning_content,
-                ts=llm_stream_end_ts,
+                ts=llm_first_text_ts or llm_stream_end_ts,
                 latency=llm_first_token_latency,
             )
 
@@ -5732,11 +5738,11 @@ class TaskManager(BaseManager):
                         )
                         eager_eot_threshold = getattr(active_transcriber, "eager_eot_threshold", None)
 
-                        if not eager_eot_threshold:
-                            logger.info(
-                                f"Skipping speculative LLM: EagerEOT disabled (eager_eot_threshold not set or zero)"
-                            )
-                        elif eot_confidence is not None and eot_confidence < eager_eot_threshold:
+                        if not getattr(active_transcriber, "eager_end_of_turn", False):
+                            logger.info("Skipping speculative LLM: eager end of turn is off for this transcriber")
+                        elif (
+                            eot_confidence is not None and eager_eot_threshold and eot_confidence < eager_eot_threshold
+                        ):
                             logger.info(
                                 f"Skipping speculative LLM: EagerEOT confidence {eot_confidence} below threshold {eager_eot_threshold}"
                             )
@@ -7598,6 +7604,7 @@ class TaskManager(BaseManager):
                     voice=self.synthesizer_voice,
                     voice_id=self.synthesizer_voice_id,
                     model=self.synthesizer_model,
+                    render_settings=self.synthesizer_render_settings,
                 )
             if self.turn_based_conversation or self.task_config["tools_config"]["output"]["provider"] == "default":
                 # Static-node clips are pre-generated as mp3 keyed by md5(text); fetch that
