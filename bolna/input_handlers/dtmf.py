@@ -14,6 +14,7 @@ from bolna.helpers.logger_config import configure_logger
 logger = configure_logger(__name__)
 
 DTMF_TERMINATOR = "#"
+DTMF_DIGITS = frozenset("0123456789*#ABCD")
 # SIP_DTMF_INTERDIGIT_TIMEOUT_S is the name the sip-trunk handler shipped with; still honoured.
 DTMF_INTERDIGIT_TIMEOUT_S = float(
     os.environ.get("DTMF_INTERDIGIT_TIMEOUT_S") or os.environ.get("SIP_DTMF_INTERDIGIT_TIMEOUT_S") or "3"
@@ -30,15 +31,17 @@ class DtmfAccumulator:
         self._timer: asyncio.Task | None = None
 
     def press(self, digit: str) -> None:
-        if not digit:
+        """One event may carry several keys; anything that is not a DTMF key is dropped."""
+        if not isinstance(digit, str):
             return
-        if digit == self._terminator:
-            logger.info("DTMF termination key pressed")
-            self._cancel_timer()
-            self.flush()
-            return
-        self._digits += digit
-        self._restart_timer()
+        for key in digit:
+            if key == self._terminator:
+                logger.info("DTMF termination key pressed")
+                self._cancel_timer()
+                self.flush()
+            elif key in DTMF_DIGITS:
+                self._digits += key
+                self._restart_timer()
 
     def flush(self) -> None:
         if not self._digits:

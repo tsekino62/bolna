@@ -47,6 +47,15 @@ async def test_digits_within_timeout_collect_into_one_entry():
     assert handler.queues["dtmf"].empty()
 
 
+async def test_a_multi_character_digit_is_split_and_junk_dropped():
+    submitted = []
+    dtmf = dtmf_module.DtmfAccumulator(submitted.append)
+    dtmf.press("12x*")
+    dtmf.press(3)
+    dtmf.press("#")
+    assert submitted == ["12*"]
+
+
 async def test_terminator_submits_immediately_without_itself():
     handler = _make_handler()
     await handler.process_message({"type": "dtmf", "digit": "1"})

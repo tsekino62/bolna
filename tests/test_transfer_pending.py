@@ -281,16 +281,30 @@ def _tool_result(tm, tool_call_id="call-1"):
     )
 
 
-@pytest.mark.parametrize("provider,status", [("trunk", 409), ("plivo", 500)], ids=["trunk", "plivo"])
-async def test_refused_transfer_is_answered_inside_the_tool_call_turn(transfer_webhook, provider, status):
+REFUSED_BODY = '{"success": false, "message": "at channel limit"}'
+
+
+@pytest.mark.parametrize(
+    "provider,status,body,message",
+    [
+        ("trunk", 409, REFUSED_BODY, "at channel limit"),
+        ("trunk", 503, REFUSED_BODY, "at channel limit"),
+        ("trunk", 404, "Not Found", "HTTP 404"),
+        ("plivo", 409, REFUSED_BODY, "at channel limit"),
+    ],
+    ids=["trunk_4xx", "trunk_5xx_success_false", "trunk_bare_4xx", "plivo_4xx"],
+)
+async def test_refused_transfer_is_answered_inside_the_tool_call_turn(
+    transfer_webhook, provider, status, body, message
+):
     tm, _ = _transfer_call(transfer_call_params={"provider": provider})
-    transfer_webhook(status=status, body='{"success": false, "message": "at channel limit"}')
+    transfer_webhook(status=status, body=body)
 
     await _call_transfer_tool(tm)
 
     assert tm.has_transfer is False
     assert tm.check_if_user_online is True
-    assert _tool_result(tm) == {"status": "failed", "message": "at channel limit"}
+    assert _tool_result(tm) == {"status": "failed", "message": message}
     # Inline, so the follow-up belongs to the running llm_task and barge-in can cancel it.
     tm._TaskManager__do_llm_generation.assert_awaited_once()
     tm._inject_and_run_llm.assert_not_awaited()
@@ -388,28 +402,29 @@ async def test_transfer_failed_frame_resumes_once_and_cancels_the_deadline(trans
     tm._inject_and_run_llm.assert_awaited_once_with(TRANSFER_FAILED_RESUME_MESSAGE.format(cause="USER_BUSY"))
 
 
-async def test_a_bare_trunk_5xx_waits_on_the_deadline(transfer_webhook):
-    # The backend may have dialled before it failed, so the fork or the deadline settles it.
-    tm, _ = _transfer_call(transfer_call_params={"provider": "trunk"})
-    transfer_webhook(status=502, body="Bad Gateway")
-
-    await _call_transfer_tool(tm)
-
-    assert tm.has_transfer is True
-    assert tm._transfer_deadline is not None
-    assert tm.transfer_call_events[-1]["success"] is None
-    tm._cancel_transfer_deadline()
-
-
-async def test_another_providers_bare_4xx_keeps_the_transfer_as_on_master(transfer_webhook):
-    tm, _ = _transfer_call(transfer_call_params={"provider": "plivo"})
-    transfer_webhook(status=400, body="Bad Request")
+@pytest.mark.parametrize(
+    "provider,status,body",
+    [
+        ("trunk", 502, "Bad Gateway"),
+        ("trunk", 504, '{"success": false, "unsettled": true, "message": "still dialling"}'),
+        ("plivo", 500, REFUSED_BODY),
+        ("plivo", 504, "Gateway Timeout"),
+        ("plivo", 400, "Bad Request"),
+    ],
+    ids=["trunk_bare_5xx", "trunk_unsettled", "plivo_5xx_success_false", "plivo_bare_5xx", "plivo_bare_4xx"],
+)
+async def test_an_unsettled_or_unrefused_answer_keeps_the_transfer(transfer_webhook, provider, status, body):
+    # A 5xx may have dialled before failing; only trunk has a fork or a deadline to settle it.
+    tm, _ = _transfer_call(transfer_call_params={"provider": provider})
+    transfer_webhook(status=status, body=body)
 
     await _call_transfer_tool(tm)
 
     assert tm.has_transfer is True
     tm._TaskManager__do_llm_generation.assert_not_awaited()
-    assert tm._transfer_deadline is None
+    assert (tm._transfer_deadline is not None) == (provider == "trunk")
+    assert tm.transfer_call_events[-1]["success"] is (None if provider == "trunk" else False)
+    tm._cancel_transfer_deadline()
 
 
 async def test_the_failure_follow_up_cannot_dial_the_transfer_again(transfer_webhook):
@@ -465,14 +480,19 @@ async def test_no_hangup_while_a_trunk_transfer_rings():
     assert tm.hangup_triggered is False
 
 
-async def test_a_bridge_reported_during_the_post_arms_no_deadline(transfer_webhook):
+@pytest.mark.parametrize(
+    "status,body", [(200, '{"success": true}'), (409, REFUSED_BODY)], ids=["accepted", "refused_late"]
+)
+async def test_a_bridge_reported_during_the_post_is_final(transfer_webhook, status, body):
+    # Once bridged, neither a deadline nor a late refusal may put the agent back over the human.
     tm, handler = _transfer_call(transfer_call_params={"provider": "trunk"})
-    transfer_webhook(during=lambda: handler.process_message({"type": "transfer_connected"}))
+    transfer_webhook(status=status, body=body, during=lambda: handler.process_message({"type": "transfer_connected"}))
 
     await _call_transfer_tool(tm)
 
     assert tm.has_transfer is True
     assert tm._transfer_deadline is None
+    tm._TaskManager__do_llm_generation.assert_not_awaited()
 
 
 async def test_transfer_connected_only_cancels_the_deadline(transfer_webhook):
@@ -515,6 +535,8 @@ async def test_transfer_provider_falls_back_to_the_fork_transport(transfer_webho
     await _call_transfer_tool(tm)
 
     assert session.posted["provider"] == "freeswitch"
+    # Only a trunk POST is bounded; every other provider keeps the session default, as on master.
+    assert session.timeout is None
 
 
 @pytest.mark.parametrize(

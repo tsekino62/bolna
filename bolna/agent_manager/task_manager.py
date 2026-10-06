@@ -4692,12 +4692,14 @@ class TaskManager(BaseManager):
             parsed = json.loads(body)
         except (TypeError, ValueError):
             parsed = None
-        # The backend answers every provider's refusal with success:false, so each one resumes.
-        if isinstance(parsed, dict) and parsed.get("success") is False:
+        parsed = parsed if isinstance(parsed, dict) else {}
+        refused = parsed.get("success") is False
+        # A 5xx may have dialled before failing; only the trunk backend tells a refusal apart.
+        if parsed.get("unsettled") is True or (status >= 500 and not (refused and self._is_trunk_call())):
+            return None
+        # Another provider's bare 4xx keeps the transfer, as on master.
+        if refused or (400 <= status < 500 and self._is_trunk_call()):
             return str(parsed.get("message") or parsed.get("detail") or f"HTTP {status}")
-        # A bare 5xx may have dialled before failing, so it waits on the deadline instead.
-        if 400 <= status < 500 and self._is_trunk_call():
-            return f"HTTP {status}"
         return None
 
     def _transfer_ring_timeout(self, param) -> int:
@@ -4737,7 +4739,10 @@ class TaskManager(BaseManager):
         finally:
             self._transfer_posting = False
         failure = refusal if refusal is not None else self._transfer_early_failure
-        if failure is not None:
+        if failure is not None and self._transfer_connected:
+            logger.info(f"transfer failed ({failure}) after the bridge for run_id={self.run_id}; ignoring")
+            failure = None
+        elif failure is not None:
             logger.warning(f"transfer failed ({failure}) for run_id={self.run_id}; resuming conversation")
             self._fail_transfer(failure)
         elif ring_timeout is not None and self.has_transfer and not self._transfer_connected:
@@ -4898,9 +4903,13 @@ class TaskManager(BaseManager):
             )
             _transfer_end_recorded = False
             try:
-                async with session.post(
-                    url, json=payload, timeout=aiohttp.ClientTimeout(total=TRANSFER_WEBHOOK_TIMEOUT_S)
-                ) as response:
+                # Only trunk is bounded; other providers keep the session default, as before.
+                timeout = (
+                    aiohttp.ClientTimeout(total=TRANSFER_WEBHOOK_TIMEOUT_S)
+                    if self._is_trunk_call()
+                    else session.timeout
+                )
+                async with session.post(url, json=payload, timeout=timeout) as response:
                     response_text = await response.text()
                     logger.info(f"Response from the server after call transfer: {response_text}")
                     convert_to_request_log(
